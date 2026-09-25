@@ -9,25 +9,24 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# Модель для валидации входящего запроса от фронтенда
+# Принимаем от фронта и ID таблицы, и имя листа
 class SyncRequest(BaseModel):
+    spreadsheet_id: str
     sheet_name: str
 
-def sync_sheets_to_postgres(sheet_name: str):
-    # 1. СТРОГО берем всё из Environment Variables Render
+def sync_sheets_to_postgres(spreadsheet_id: str, sheet_name: str):
     script_url = os.getenv("APPSCRIPT_URL")
     secret_token = os.getenv("APPSCRIPT_TOKEN")
     database_url = os.getenv("DATABASE_URL")
     
     if not all([script_url, secret_token, database_url]):
-        raise ValueError("Не все переменные окружения (APPSCRIPT_URL, APPSCRIPT_TOKEN, DATABASE_URL) заданы в Render!")
+        raise ValueError("Не все переменные окружения заданы в Render!")
 
-    # 2. Формируем параметры для Apps Script
-    # Используем params, чтобы requests сам корректно закодировал кириллицу или пробелы в имени листа
     params = {
         "token": secret_token,
+        "spreadsheet_id": spreadsheet_id,
         "sheet_name": sheet_name,
-        "_": int(time.time()) # защита от кэша
+        "_": int(time.time())
     }
     
     response = requests.get(script_url, params=params, timeout=60)
@@ -46,15 +45,12 @@ def sync_sheets_to_postgres(sheet_name: str):
         
     df = pd.DataFrame(data_list)
 
-    # 3. Подключение к БД (Render отдает postgres://, SQLAlchemy требует postgresql://)
     if database_url.startswith("postgres://"):
         database_url = database_url.replace("postgres://", "postgresql://", 1)
 
     engine = create_engine(database_url)
 
-    # 4. Выгрузка в БД
-    # Имя таблицы в БД можно сделать таким же, как имя листа, или жестко задать.
-    # Здесь мы используем имя листа, очищенное для БД (нижний регистр, без пробелов).
+    # Имя таблицы в БД = имя листа (очищенное)
     db_table_name = sheet_name.lower().replace(" ", "_").replace("-", "_")
     
     df.to_sql(
@@ -67,11 +63,10 @@ def sync_sheets_to_postgres(sheet_name: str):
     
     return len(df)
 
-# Эндпоинт, который принимает JSON от фронтенда
 @app.post("/api/sync-data")
 def trigger_sync(request: SyncRequest):
     try:
-        rows_count = sync_sheets_to_postgres(request.sheet_name)
+        rows_count = sync_sheets_to_postgres(request.spreadsheet_id, request.sheet_name)
         return JSONResponse(content={
             "status": "success", 
             "message": f"Успех! Из листа '{request.sheet_name}' выгружено строк: {rows_count}"
