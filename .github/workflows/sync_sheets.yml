@@ -1,0 +1,40 @@
+name: Sync Google Sheets to Postgres
+
+on:
+  # Запуск вручную по кнопке с возможностью ввода параметров
+  workflow_dispatch:
+    inputs:
+      spreadsheet_id:
+        description: 'ID Google Таблицы (длинная строка из URL)'
+        required: true
+        type: string
+      sheet_name:
+        description: 'Имя листа для выгрузки'
+        required: true
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run sync script
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          APPSCRIPT_URL: ${{ secrets.APPSCRIPT_URL }}
+          APPSCRIPT_TOKEN: ${{ secrets.APPSCRIPT_TOKEN }}
+          # Передаем параметры, которые ввел пользователь в интерфейсе GitHub
+          SPREADSHEET_ID: ${{ github.event.inputs.spreadsheet_id }}
+          SHEET_NAME: ${{ github.event.inputs.sheet_name }}
+        run: python sync_script.py
