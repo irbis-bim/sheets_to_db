@@ -5,7 +5,7 @@ import os
 import json
 import re
 import requests
-from io import StringIO
+import io
 
 # --- НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -28,15 +28,15 @@ def extract_sheet_id(url):
     return match.group(1) if match else None
 
 def get_sheet_names(sheet_id):
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/pub"
+    """Получает названия листов через скачивание метаданных XLSX."""
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
     try:
-        resp = requests.get(url, timeout=5)
-        if resp.status_code == 200 and "select" in resp.text:
-            names = re.findall(r'<option[^>]*value="[^"]*"[^>]*>([^<]+)</option>', resp.text)
-            if names:
-                return names
-    except Exception:
-        pass
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            excel_file = pd.ExcelFile(io.BytesIO(resp.content))
+            return excel_file.sheet_names
+    except Exception as e:
+        st.warning(f"Не удалось автоматически получить список листов: {e}")
     return None
 
 def fetch_sheet_data(sheet_id, sheet_name):
@@ -45,7 +45,7 @@ def fetch_sheet_data(sheet_id, sheet_name):
     
     resp = requests.get(url, timeout=15)
     if resp.status_code == 200:
-        df = pd.read_csv(StringIO(resp.text))
+        df = pd.read_csv(io.StringIO(resp.text))
         return df
     else:
         raise Exception(f"Ошибка при загрузке данных. Статус: {resp.status_code}")
@@ -53,15 +53,15 @@ def fetch_sheet_data(sheet_id, sheet_name):
 # --- ИНТЕРФЕЙС STREAMLIT ---
 
 st.set_page_config(page_title="Экспорт Google Sheets -> PostgreSQL", layout="wide")
-st.title("Экспорт чек-листов в базу данных")
+st.title("Экспорт данных из чек-листов в базу данных")
 
-st.sidebar.header("Настройки Google Sheets")
+st.sidebar.header("Настройки экспорта")
 
 if not SHEETS_CONFIG:
     st.warning("Список таблиц пуст. Добавьте их в переменную окружения SHEETS_CONFIG.")
     st.stop()
 
-selected_table_name = st.sidebar.selectbox("Выберите таблицу", list(SHEETS_CONFIG.keys()))
+selected_table_name = st.sidebar.selectbox("1. Выберите таблицу", list(SHEETS_CONFIG.keys()))
 sheet_url = SHEETS_CONFIG[selected_table_name]
 sheet_id = extract_sheet_id(sheet_url)
 
@@ -69,23 +69,21 @@ if not sheet_id:
     st.sidebar.error("Неверный формат ссылки на Google Sheets")
     st.stop()
 
+# Автоматическое получение листов
 available_sheets = get_sheet_names(sheet_id)
 
 if available_sheets:
-    selected_sheet = st.sidebar.selectbox("Выберите лист", available_sheets)
+    selected_sheet = st.sidebar.selectbox("2. Выберите лист", available_sheets)
 else:
-    st.sidebar.info("Не удалось автоопределить листы. Введите имя вручную.")
-    selected_sheet = st.sidebar.text_input("Имя листа", value="Лист1")
+    st.sidebar.warning("Не удалось получить список листов автоматически.")
+    selected_sheet = st.sidebar.text_input("Введите имя листа вручную", value="Лист1")
 
-# --- НАСТРОЙКИ БД (С НОВЫМИ ИМЕНАМИ) ---
-st.sidebar.header("Настройки PostgreSQL")
-db_schema = st.sidebar.text_input("Схема в PostgreSQL", value="check_list")
-db_table_name = st.sidebar.text_input("Имя таблицы в БД", value="checklist_details_new")
+# --- СКРЫТЫЕ НАСТРОЙКИ БД (НЕ ОТОБРАЖАЮТСЯ В ИНТЕРФЕЙСЕ) ---
+db_schema = "check_list"
+db_table_name = "checklist_details_new"
 
 if st.sidebar.button("Начать экспорт"):
-    full_table_name = f"{db_schema}.{db_table_name}"
-    
-    with st.status(f"Экспорт в {full_table_name}...", expanded=True) as status:
+    with st.status(f"Экспорт листа '{selected_sheet}'...", expanded=True) as status:
         try:
             # Шаг 1: Чтение данных
             st.write("Подключение к Google Sheets и чтение данных...")
@@ -98,7 +96,7 @@ if st.sidebar.button("Начать экспорт"):
                 st.stop()
 
             # Шаг 2: Очистка и нормализация данных
-            st.write("🧹 Очистка и подготовка данных...")
+            st.write("Очистка и подготовка данных...")
             
             # Удаляем строки, которые выглядят как разделители markdown
             df = df[~df.astype(str).apply(lambda x: x.str.contains(r'^\|?---\|?$', regex=True)).any(axis=1)]
@@ -109,28 +107,27 @@ if st.sidebar.button("Начать экспорт"):
             # Приводим названия колонок к нижнему регистру и заменяем пробелы на подчеркивания
             df.columns = [str(col).strip().lower().replace(' ', '_') for col in df.columns]
             
-            # Удаляем строки, где project_code выглядит как ссылка (артефакт парсинга Google Sheets)
+            # ФИЛЬТР: Удаляем строки, где project_code выглядит как ссылка (артефакт парсинга Google)
             if 'project_code' in df.columns:
                 df = df[~df['project_code'].astype(str).str.contains('http', na=False)]
             
-            # Преобразование запятых в точки для числовых колонок
+            # ИСПРАВЛЕНИЕ ОШИБКИ: Преобразование запятых в точки для числовых колонок
             numeric_cols = ['check_type_num', 'check_id', 'score', 'criteria', 'total', 'checklist_id']
             
             for col in numeric_cols:
                 if col in df.columns:
                     # Заменяем запятую на точку
                     df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
-                    # Преобразуем в числовой тип. 
-                    # errors='coerce' превратит нечисловые значения (например, "k.lod" или пустые строки) в NaN (NULL в БД)
+                    # Преобразуем в числовой тип. errors='coerce' превратит нечисловые значения (например, "k.lod") в NULL
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             
             # Заполняем NaN значениями None для корректной вставки NULL в PostgreSQL
             df = df.where(pd.notnull(df), None)
             
-            st.write(f"✅ Данные очищены. Обработано строк: {len(df)}")
+            st.write(f"Данные очищены. Готово к загрузке строк: {len(df)}")
 
             # Шаг 3: Подключение к БД
-            st.write("Подключение к базе данных...")
+            st.write("🔌 Подключение к PostgreSQL...")
             engine = sqlalchemy.create_engine(DATABASE_URL)
             inspector = sqlalchemy.inspect(engine)
             
@@ -153,14 +150,14 @@ if st.sidebar.button("Начать экспорт"):
             
             if df_filtered.empty:
                 st.error("Ни одна колонка из листа не совпадает со структурой таблицы в БД.")
-                st.info(f"Колонки в БД: {', '.join(db_columns)}")
+                st.info(f"Ожидаемые колонки в БД: {', '.join(db_columns)}")
                 status.update(label="Ошибка: несовпадение колонок", state="error")
                 st.stop()
                 
             st.write(f"Найдено совпадающих колонок: {len(cols_to_insert)} из {len(db_columns)}")
 
             # Шаг 4: Загрузка в БД
-            st.write(f"Загрузка данных в {full_table_name}...")
+            st.write(f"Загрузка данных в PostgreSQL...")
             
             df_filtered.to_sql(
                 name=db_table_name, 
