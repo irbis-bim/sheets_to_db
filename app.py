@@ -98,14 +98,36 @@ if st.sidebar.button("Начать экспорт"):
                 st.stop()
 
             # Шаг 2: Очистка и нормализация данных
-            st.write("Очистка и подготовка данных...")
-            # Удаляем строки с маркдаун-разделителями (на всякий случай)
+            st.write("🧹 Очистка и подготовка данных...")
+            
+            # Удаляем строки, которые выглядят как разделители markdown
             df = df[~df.astype(str).apply(lambda x: x.str.contains(r'^\|?---\|?$', regex=True)).any(axis=1)]
+            
+            # Удаляем полностью пустые столбцы
             df = df.dropna(axis=1, how='all')
             
-            # Приводим названия колонок к нижнему регистру и убираем пробелы
-            df.columns = [col.strip().lower().replace(' ', '_') for col in df.columns]
-            st.write(f"Данные очищены. Колонки: {', '.join(df.columns)}")
+            # Приводим названия колонок к нижнему регистру и заменяем пробелы на подчеркивания
+            df.columns = [str(col).strip().lower().replace(' ', '_') for col in df.columns]
+            
+            # Удаляем строки, где project_code выглядит как ссылка (артефакт парсинга Google Sheets)
+            if 'project_code' in df.columns:
+                df = df[~df['project_code'].astype(str).str.contains('http', na=False)]
+            
+            # Преобразование запятых в точки для числовых колонок
+            numeric_cols = ['check_type_num', 'check_id', 'score', 'criteria', 'total', 'checklist_id']
+            
+            for col in numeric_cols:
+                if col in df.columns:
+                    # Заменяем запятую на точку
+                    df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
+                    # Преобразуем в числовой тип. 
+                    # errors='coerce' превратит нечисловые значения (например, "k.lod" или пустые строки) в NaN (NULL в БД)
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # Заполняем NaN значениями None для корректной вставки NULL в PostgreSQL
+            df = df.where(pd.notnull(df), None)
+            
+            st.write(f"✅ Данные очищены. Обработано строк: {len(df)}")
 
             # Шаг 3: Подключение к БД
             st.write("Подключение к базе данных...")
